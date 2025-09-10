@@ -3,6 +3,7 @@ import redis
 from typing import List, Optional
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -132,78 +133,114 @@ class ChatRedisDatabase:
             print(f"❌ Erro ao limpar confirmação pendente: {e}")
             return False
     
-    def add_messages(self, user_id: str, messages: bytes):
+    def add_messages(self, user_id: str, messages_json: bytes):
         """
-        Adiciona mensagens ao histórico do usuário
+        Adiciona novas mensagens ao histórico do usuário no Redis.
         
         Args:
-            user_id: ID único do usuário  
-            messages: Mensagens serializadas em bytes
+            user_id: ID do usuário
+            messages_json: Mensagens em formato JSON bytes (do Pydantic AI)
         """
         try:
             chat_key = self._get_chat_key(user_id)
-            message_data = messages.decode('utf-8')
+            
+            # Converter bytes para string se necessário
+            if isinstance(messages_json, bytes):
+                messages_str = messages_json.decode('utf-8')
+            else:
+                messages_str = json.dumps(messages_json) if not isinstance(messages_json, str) else messages_json
+            
+            # Parse das mensagens
+            messages_list = json.loads(messages_str)
+            
+            # Filtrar mensagens válidas (evita problemas com tool calls órfãs)
+            valid_messages = []
+            for message in messages_list:
+                # Não salvar mensagens de tool sem contexto adequado
+                if isinstance(message, dict):
+                    # Verificar se é mensagem de tool órfã
+                    parts = message.get('parts', [])
+                    if parts and isinstance(parts[0], dict) and parts[0].get('role') == 'tool':
+                        print(f"⚠️ Pulando mensagem de tool órfã")
+                        continue  # Pular mensagens de tool órfãs
+                    
+                valid_messages.append(message)
             
             if self.redis_client:
-                # Usar Redis
-                # Adicionar à lista com timestamp
-                import time
-                timestamp = int(time.time())
+                # Adicionar apenas mensagens válidas ao Redis
+                for message in valid_messages:
+                    message_with_timestamp = {
+                        "timestamp": datetime.now().isoformat(),
+                        "data": message
+                    }
+                    
+                    # Adicionar mensagem ao início da lista (LPUSH)
+                    self.redis_client.lpush(chat_key, json.dumps(message_with_timestamp))
                 
-                # Usar lista Redis para manter ordem cronológica
-                self.redis_client.lpush(chat_key, json.dumps({
-                    "timestamp": timestamp,
-                    "data": message_data
-                }))
-                
-                # Manter apenas últimas 100 mensagens por usuário
+                # Manter apenas as últimas 100 mensagens
                 self.redis_client.ltrim(chat_key, 0, 99)
                 
-                # Definir expiração de 7 dias para chaves inativas
+                # Definir expiração de 7 dias
                 self.redis_client.expire(chat_key, 7 * 24 * 3600)
+                
+                print(f"💾 {len(valid_messages)} mensagens válidas adicionadas ao Redis para usuário {user_id}")
                 
             else:
                 # Fallback: memória local
                 if user_id not in self._local_cache:
                     self._local_cache[user_id] = []
                 
-                self._local_cache[user_id].insert(0, message_data)
+                for message in valid_messages:
+                    self._local_cache[user_id].insert(0, json.dumps(message))
                 
                 # Manter apenas últimas 100 mensagens
                 if len(self._local_cache[user_id]) > 100:
                     self._local_cache[user_id] = self._local_cache[user_id][:100]
                 
         except Exception as e:
-            print(f"❌ Erro ao salvar mensagens: {e}")
+            print(f"❌ Erro ao adicionar mensagens no Redis: {e}")
+            raise e
     
     def get_messages(self, user_id: str, limit: int = 50) -> List[ModelMessage]:
         """
-        Recupera mensagens do histórico do usuário
+        Recupera mensagens do histórico do usuário.
         
         Args:
-            user_id: ID único do usuário
-            limit: Número máximo de mensagens (padrão 50)
+            user_id: ID do usuário
+            limit: Número máximo de mensagens para retornar
             
         Returns:
-            Lista de mensagens do modelo
+            Lista de mensagens no formato do Pydantic AI
         """
         try:
             chat_key = self._get_chat_key(user_id)
             
             if self.redis_client:
-                # Usar Redis
+                # Buscar mensagens do Redis (LRANGE pega da mais recente para mais antiga)
                 raw_messages = self.redis_client.lrange(chat_key, 0, limit - 1)
                 
+                if not raw_messages:
+                    return []
+                
+                # Converter de volta para objetos de mensagem do Pydantic AI
                 messages = []
                 for raw_msg in reversed(raw_messages):  # Reverter para ordem cronológica
                     try:
-                        msg_obj = json.loads(raw_msg)
-                        message_data = msg_obj["data"]
-                        messages.extend(ModelMessagesTypeAdapter.validate_json(message_data))
-                    except Exception as e:
-                        print(f"⚠️ Erro ao processar mensagem: {e}")
+                        msg_data = json.loads(raw_msg)
+                        message_content = msg_data.get("data")
+                        
+                        # Usar o ModelMessagesTypeAdapter para deserializar
+                        if isinstance(message_content, str):
+                            parsed_message = ModelMessagesTypeAdapter.validate_json(message_content)[0]
+                        else:
+                            parsed_message = ModelMessagesTypeAdapter.validate_python([message_content])[0]
+                        messages.append(parsed_message)
+                        
+                    except Exception as parse_error:
+                        print(f"⚠️ Erro ao processar mensagem: {parse_error}")
                         continue
                 
+                print(f"📚 {len(messages)} mensagens recuperadas do Redis para usuário {user_id}")
                 return messages
                 
             else:
@@ -214,7 +251,11 @@ class ChatRedisDatabase:
                 messages = []
                 for message_data in reversed(self._local_cache[user_id][:limit]):
                     try:
-                        messages.extend(ModelMessagesTypeAdapter.validate_json(message_data))
+                        if isinstance(message_data, str):
+                            parsed_message = ModelMessagesTypeAdapter.validate_json(message_data)[0]
+                        else:
+                            parsed_message = ModelMessagesTypeAdapter.validate_python([message_data])[0]
+                        messages.append(parsed_message)
                     except Exception as e:
                         print(f"⚠️ Erro ao processar mensagem: {e}")
                         continue

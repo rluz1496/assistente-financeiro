@@ -844,6 +844,56 @@ def find_pending_income_by_description(user_id: str, description_keyword: str):
         return []
 
 
+def find_pending_expenses_by_description(user_id: str, description_keyword: str):
+    """Encontra despesas pendentes por palavra-chave na descrição"""
+    if not supabase:
+        print(f"Mock: Buscando despesas pendentes com palavra-chave '{description_keyword}' para usuário {user_id}")
+        return []
+    
+    try:
+        resp = supabase.table("transactions").select("""
+            id, amount, description, payment_method, due_date, created_at,
+            categories(name)
+        """).eq("user_id", user_id).eq("transaction_type", "expense").is_("paid_date", "null").ilike("description", f"%{description_keyword}%").order("due_date", desc=False).execute()
+        
+        return resp.data or []
+        
+    except Exception as e:
+        print(f"Erro ao buscar despesas pendentes: {e}")
+        return []
+
+
+def mark_expense_as_paid(transaction_id: str, user_id: str, paid_date: str = None):
+    """Marca uma despesa como paga"""
+    if not supabase:
+        print(f"Mock: Marcando despesa {transaction_id} como paga para usuário {user_id}")
+        return {"success": True, "message": "Despesa marcada como paga! (modo desenvolvimento)"}
+    
+    try:
+        # Usar data atual se não fornecida
+        if not paid_date:
+            from datetime import date
+            paid_date = date.today().isoformat()
+        
+        # Atualizar a despesa
+        resp = supabase.table("transactions").update({
+            "paid_date": paid_date
+        }).eq("id", transaction_id).eq("user_id", user_id).eq("transaction_type", "expense").execute()
+        
+        if resp.data:
+            return {
+                "success": True, 
+                "message": f"Despesa marcada como paga em {paid_date}!"
+            }
+        else:
+            return {"success": False, "message": "Despesa não encontrada"}
+            
+    except Exception as e:
+        error_msg = f"Erro ao marcar despesa como paga: {str(e)}"
+        print(error_msg)
+        return {"success": False, "message": error_msg}
+
+
 # ==================== FUNÇÕES DE SALDO E ANÁLISES ====================
 
 def calculate_user_balance(user_id: str, start_date: str = None, end_date: str = None):

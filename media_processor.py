@@ -22,7 +22,7 @@ class MediaProcessor:
     """Processador de mídia para áudio e imagem"""
     
     @staticmethod
-    async def get_media_from_evolution(message_id: str, instance: str, convert_to_mp4: bool = False) -> Optional[str]:
+    async def get_media_from_evolution(message_id: str, instance: str, convert_to_mp4: str) -> Optional[str]:
         """
         Baixa mídia da Evolution API e retorna como base64
         
@@ -44,7 +44,7 @@ class MediaProcessor:
             url = f"{EVOLUTION_BASE_URL}chat/getBase64FromMediaMessage/{instance}"
             
             payload = {
-                "convertToMp4": str(convert_to_mp4),
+                "convertToMp4": "false",
                 "message": {
                     "key": {
                         "id": message_id
@@ -53,7 +53,6 @@ class MediaProcessor:
             }
             
             headers = {
-                "Content-Type": "application/json",
                 "apikey": "429683C4C977415CAAFCCE10F7D57E11"
             }
             

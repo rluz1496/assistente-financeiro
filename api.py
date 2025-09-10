@@ -339,8 +339,12 @@ async def process_user_message(phone_number: str, message_text: str, user_name: 
             credit_cards=credit_cards
         )
         
-        # Executar o agente
-        result = await agent.run(message_text, deps=deps)
+        # Recuperar histórico de mensagens do Redis
+        message_history = redis_db.get_messages(user_id, limit=50)
+        print(f"📚 Carregado {len(message_history)} mensagens do histórico para {user_name}")
+        
+        # Executar o agente com o histórico de mensagens
+        result = await agent.run(message_text, deps=deps, message_history=message_history)
         
         # Extrair o texto da resposta do AgentRunResult
         if hasattr(result, 'output'):
@@ -363,6 +367,16 @@ async def process_user_message(phone_number: str, message_text: str, user_name: 
             else:
                 response_text = result_str
                 
+        # Salvar as novas mensagens no Redis
+        try:
+            new_messages = result.new_messages()
+            if new_messages:
+                messages_json = result.new_messages_json()
+                redis_db.add_messages(user_id, messages_json)
+                print(f"💾 Salvo {len(new_messages)} novas mensagens no Redis para {user_name}")
+        except Exception as redis_error:
+            print(f"⚠️ Erro ao salvar mensagens no Redis: {redis_error}")
+        
         await send_whatsapp_message(phone_number, response_text)
         
         print(f"✅ Mensagem processada para {user_name} ({phone_number})")
@@ -395,6 +409,51 @@ async def health_check():
         "instance": EVOLUTION_INSTANCE,
         "timestamp": datetime.now().isoformat()
     }
+
+@app.get("/chat/stats/{user_id}")
+async def get_chat_stats(user_id: str):
+    """Obter estatísticas do chat de um usuário"""
+    try:
+        stats = redis_db.get_chat_stats(user_id)
+        return {
+            "user_id": user_id,
+            "stats": stats,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao obter estatísticas: {str(e)}")
+
+@app.delete("/chat/clear/{user_id}")
+async def clear_chat(user_id: str):
+    """Limpar histórico de chat de um usuário"""
+    try:
+        redis_db.clear_chat(user_id)
+        return {
+            "message": f"Histórico do usuário {user_id} limpo com sucesso",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao limpar chat: {str(e)}")
+
+@app.get("/chat/history/{user_id}")
+async def get_chat_history(user_id: str, limit: int = 50):
+    """Obter histórico de mensagens de um usuário"""
+    try:
+        messages = redis_db.get_messages(user_id, limit=limit)
+        return {
+            "user_id": user_id,
+            "message_count": len(messages),
+            "messages": [
+                {
+                    "type": type(msg).__name__,
+                    "parts_count": len(msg.parts) if hasattr(msg, 'parts') else 0,
+                    "timestamp": msg.timestamp.isoformat() if hasattr(msg, 'timestamp') else None
+                } for msg in messages
+            ],
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao obter histórico: {str(e)}")
 
 @app.post("/webhook/evolution")
 async def evolution_webhook(request: Request, background_tasks: BackgroundTasks):

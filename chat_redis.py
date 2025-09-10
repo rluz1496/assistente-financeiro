@@ -48,6 +48,90 @@ class ChatRedisDatabase:
         """Gera chave única para o chat do usuário"""
         return f"{self.key_prefix}{user_id}"
     
+    def _get_confirmation_key(self, user_id: str) -> str:
+        """Gera chave única para dados de confirmação do usuário"""
+        return f"confirmation:{user_id}"
+    
+    def save_pending_confirmation(self, user_id: str, data: dict, expires_in: int = 300) -> bool:
+        """
+        Salva dados pendentes de confirmação (válidos por 5 minutos)
+        
+        Args:
+            user_id: ID do usuário
+            data: Dados da transação pendente 
+            expires_in: Tempo de expiração em segundos (padrão: 300s = 5min)
+        """
+        try:
+            key = self._get_confirmation_key(user_id)
+            
+            if self.redis_client:
+                # Salvar no Redis com expiração
+                self.redis_client.setex(
+                    key,
+                    expires_in,
+                    json.dumps(data, ensure_ascii=False)
+                )
+                return True
+            else:
+                # Fallback: salvar em memória local (sem expiração automática)
+                self._local_cache[key] = data
+                return True
+                
+        except Exception as e:
+            print(f"❌ Erro ao salvar confirmação pendente: {e}")
+            return False
+    
+    def get_pending_confirmation(self, user_id: str) -> Optional[dict]:
+        """
+        Recupera dados pendentes de confirmação
+        
+        Args:
+            user_id: ID do usuário
+            
+        Returns:
+            Dados da transação pendente ou None se não existir
+        """
+        try:
+            key = self._get_confirmation_key(user_id)
+            
+            if self.redis_client:
+                # Buscar no Redis
+                data = self.redis_client.get(key)
+                if data:
+                    return json.loads(data)
+                return None
+            else:
+                # Fallback: buscar em memória local
+                return self._local_cache.get(key)
+                
+        except Exception as e:
+            print(f"❌ Erro ao recuperar confirmação pendente: {e}")
+            return None
+    
+    def clear_pending_confirmation(self, user_id: str) -> bool:
+        """
+        Remove dados pendentes de confirmação
+        
+        Args:
+            user_id: ID do usuário
+        """
+        try:
+            key = self._get_confirmation_key(user_id)
+            
+            if self.redis_client:
+                # Remover do Redis
+                self.redis_client.delete(key)
+                return True
+            else:
+                # Fallback: remover da memória local
+                if key in self._local_cache:
+                    del self._local_cache[key]
+                return True
+                
+        except Exception as e:
+            print(f"❌ Erro ao limpar confirmação pendente: {e}")
+            return False
+    
     def add_messages(self, user_id: str, messages: bytes):
         """
         Adiciona mensagens ao histórico do usuário

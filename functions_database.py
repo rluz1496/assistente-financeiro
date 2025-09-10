@@ -1144,3 +1144,77 @@ def get_pending_commitments(user_id: str):
             "next_month": {"total": 0, "count": 0, "items": []},
             "future": {"total": 0, "count": 0, "items": []}
         }
+
+def edit_transaction(user_id: str, description_keyword: str, new_payment_method: str = None, 
+                    new_category_name: str = None, new_amount: float = None, 
+                    new_description: str = None):
+    """
+    Edita uma transação existente baseada na descrição
+    
+    Args:
+        user_id: ID do usuário
+        description_keyword: Palavra-chave para encontrar a transação
+        new_payment_method: Novo método de pagamento (opcional)
+        new_category_name: Nova categoria (opcional)
+        new_amount: Novo valor (opcional)
+        new_description: Nova descrição (opcional)
+    """
+    if not supabase:
+        return {"success": True, "message": f"Mock: Transação com '{description_keyword}' editada com sucesso!"}
+    
+    try:
+        # Buscar transação pela descrição (mais recente primeiro)
+        resp = supabase.table("transactions").select("*").eq("user_id", user_id).ilike("description", f"%{description_keyword}%").order("created_at", desc=True).limit(1).execute()
+        
+        if not resp.data:
+            return {"success": False, "message": f"Nenhuma transação encontrada com '{description_keyword}'"}
+        
+        transaction = resp.data[0]
+        transaction_id = transaction["id"]
+        
+        # Preparar dados para atualização
+        update_data = {}
+        
+        if new_payment_method:
+            update_data["payment_method"] = new_payment_method
+        
+        if new_amount:
+            update_data["amount"] = abs(new_amount)
+            
+        if new_description:
+            update_data["description"] = new_description
+            
+        # Se mudou categoria, buscar ID da nova categoria
+        if new_category_name:
+            # Buscar categoria por nome
+            cat_resp = supabase.table("categories").select("id").eq("user_id", user_id).ilike("name", f"%{new_category_name}%").execute()
+            if cat_resp.data:
+                update_data["category_id"] = cat_resp.data[0]["id"]
+            else:
+                return {"success": False, "message": f"Categoria '{new_category_name}' não encontrada"}
+        
+        if not update_data:
+            return {"success": False, "message": "Nenhuma alteração especificada"}
+        
+        # Atualizar transação
+        update_resp = supabase.table("transactions").update(update_data).eq("id", transaction_id).execute()
+        
+        if update_resp.data:
+            changes = []
+            if new_payment_method:
+                changes.append(f"método de pagamento para {new_payment_method}")
+            if new_category_name:
+                changes.append(f"categoria para {new_category_name}")
+            if new_amount:
+                changes.append(f"valor para R$ {new_amount:.2f}")
+            if new_description:
+                changes.append(f"descrição para {new_description}")
+            
+            changes_text = ", ".join(changes)
+            return {"success": True, "message": f"✅ Transação '{transaction['description']}' atualizada! Alterações: {changes_text}"}
+        else:
+            return {"success": False, "message": "Erro ao atualizar transação"}
+            
+    except Exception as e:
+        print(f"Erro ao editar transação: {e}")
+        return {"success": False, "message": f"Erro ao editar: {str(e)}"}

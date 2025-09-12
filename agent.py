@@ -535,6 +535,314 @@ async def execute_dynamic_query(
         return f"❌ Erro na consulta: {str(e)}"
 
 
+# ==================== NOVAS TOOLS: ORÇAMENTOS E METAS ====================
+
+# Tool para definir orçamento de categoria
+async def set_category_budget(
+    ctx: RunContext,
+    category_name: str,
+    budget_amount: float,
+    period_type: str = "monthly"
+) -> str:
+    """
+    Define orçamento para uma categoria específica.
+    
+    Args:
+        category_name: Nome da categoria
+        budget_amount: Valor do orçamento
+        period_type: Período ('weekly', 'monthly', 'yearly')
+    """
+    if not ctx.deps:
+        return "❌ Erro: Dados do usuário não encontrados"
+    
+    user_id = ctx.deps.user_id
+    
+    # Buscar categoria
+    category_id = None
+    category_type = None
+    for cat in ctx.deps.categories:
+        if cat["name"].lower() == category_name.lower():
+            category_id = cat["id"]
+            category_type = cat.get("category_type", "expense")
+            break
+    
+    if not category_id:
+        categories_text = ", ".join([cat["name"] for cat in ctx.deps.categories if cat.get("category_type") == "expense"])
+        return f"❌ Categoria '{category_name}' não encontrada.\n\n📂 Categorias de despesa disponíveis: {categories_text}"
+    
+    # Validar se é categoria de despesa
+    if category_type != "expense":
+        return f"❌ Orçamentos só podem ser definidos para categorias de **despesas**.\n\n💡 '{category_name}' é uma categoria de receita."
+    
+    try:
+        from functions_database import supabase
+        
+        # Inserir ou atualizar orçamento
+        result = supabase.table("category_budgets").upsert({
+            "user_id": user_id,
+            "category_id": category_id,
+            "budget_amount": budget_amount,
+            "period_type": period_type,
+            "is_active": True
+        }, on_conflict="user_id,category_id,period_type").execute()
+        
+        calc = FinancialCalculator()
+        period_text = {"weekly": "semanal", "monthly": "mensal", "yearly": "anual"}[period_type]
+        
+        return f"✅ **Orçamento definido com sucesso!**\n\n📊 **Categoria:** {category_name}\n💰 **Orçamento {period_text}:** {calc.format_currency(budget_amount)}\n\n🎯 **Alertas configurados:**\n• 50% = {calc.format_currency(budget_amount * 0.5)}\n• 75% = {calc.format_currency(budget_amount * 0.75)}\n• 90% = {calc.format_currency(budget_amount * 0.9)}\n\n📱 *Vou te avisar conforme os gastos se aproximarem do limite!*"
+        
+    except Exception as e:
+        return f"❌ Erro ao definir orçamento: {str(e)}"
+
+
+# Tool para verificar status dos orçamentos
+async def check_budget_status(
+    ctx: RunContext,
+    category_name: str = None,
+    period_type: str = "monthly"
+) -> str:
+    """
+    Verifica status dos orçamentos das categorias.
+    
+    Args:
+        category_name: Nome da categoria específica (opcional)
+        period_type: Período a verificar
+    """
+    if not ctx.deps:
+        return "❌ Erro: Dados do usuário não encontrados"
+    
+    try:
+        from functions_database import supabase
+        from datetime import datetime, timedelta
+        
+        # Buscar orçamentos ativos
+        budgets_query = supabase.table("category_budgets").select(
+            "*, categories(name, category_type)"
+        ).eq("user_id", ctx.deps.user_id).eq("is_active", True).eq("period_type", period_type)
+        
+        if category_name:
+            # Buscar categoria específica
+            category_id = None
+            for cat in ctx.deps.categories:
+                if cat["name"].lower() == category_name.lower():
+                    category_id = cat["id"]
+                    break
+            
+            if category_id:
+                budgets_query = budgets_query.eq("category_id", category_id)
+        
+        budgets_result = budgets_query.execute()
+        budgets = budgets_result.data or []
+        
+        if not budgets:
+            if category_name:
+                return f"📊 Categoria '{category_name}' não tem orçamento definido.\n\n💡 Diga 'define orçamento de R$ X para {category_name}' para criar!"
+            else:
+                return "📊 Nenhum orçamento definido ainda.\n\n💡 Diga 'define orçamento de R$ X para [categoria]' para começar!"
+        
+        # Calcular período atual
+        today = datetime.now().date()
+        if period_type == "weekly":
+            period_start = today - timedelta(days=today.weekday())
+            period_end = period_start + timedelta(days=6)
+        elif period_type == "monthly":
+            period_start = today.replace(day=1)
+            next_month = period_start.replace(month=period_start.month % 12 + 1) if period_start.month < 12 else period_start.replace(year=period_start.year + 1, month=1)
+            period_end = next_month - timedelta(days=1)
+        else:  # yearly
+            period_start = today.replace(month=1, day=1)
+            period_end = today.replace(month=12, day=31)
+        
+        calc = FinancialCalculator()
+        results = []
+        total_budget = 0
+        total_spent = 0
+        
+        # Usar execute_dynamic_query para buscar gastos por categoria
+        query_builder = DynamicQueryBuilder(ctx.deps)
+        
+        for budget in budgets:
+            category_name_db = budget["categories"]["name"]
+            budget_amount = float(budget["budget_amount"])
+            total_budget += budget_amount
+            
+            # Buscar gastos direto do banco para esta categoria específica
+            try:
+                # Buscar categoria ID
+                category_id = budget["category_id"]
+                
+                # Consulta direta no banco para gastos da categoria no período
+                gastos_query = supabase.table("transactions").select("amount").eq(
+                    "user_id", ctx.deps.user_id
+                ).eq("transaction_type", "expense").eq(
+                    "category_id", category_id
+                ).gte("transaction_date", period_start.strftime('%Y-%m-%d')).lte(
+                    "transaction_date", period_end.strftime('%Y-%m-%d')
+                )
+                
+                gastos_result = gastos_query.execute()
+                
+                # Somar gastos da categoria
+                gasto_atual = 0.0
+                if gastos_result.data:
+                    gasto_atual = sum(float(t["amount"]) for t in gastos_result.data)
+                
+            except Exception as e:
+                # Fallback: usar o método anterior se houver erro
+                gastos_result = await query_builder.execute_query(
+                    query_type="summary",
+                    filters={
+                        "transaction_type": "expense",
+                        "categoria": category_name_db
+                    },
+                    period_start=period_start.strftime('%Y-%m-%d'),
+                    period_end=period_end.strftime('%Y-%m-%d')
+                )
+                
+                # Extrair valor gasto com regex (método anterior)
+                gasto_atual = 0.0
+                if "R$" in gastos_result:
+                    import re
+                    valores = re.findall(r'R\$\s*([\d.,]+)', gastos_result)
+                    if valores:
+                        try:
+                            valor_str = valores[0].replace('.', '').replace(',', '.')
+                            gasto_atual = float(valor_str)
+                        except:
+                            pass
+            
+            total_spent += gasto_atual
+            
+            # Calcular porcentagens e status
+            porcentagem = (gasto_atual / budget_amount) * 100 if budget_amount > 0 else 0
+            valor_restante = budget_amount - gasto_atual
+            
+            # Definir emoji e status baseado na porcentagem
+            if porcentagem >= 100:
+                emoji = "🔴"
+                status = "ORÇAMENTO ULTRAPASSADO!"
+                status_color = "🚨"
+            elif porcentagem >= 90:
+                emoji = "🟠"
+                status = "Atenção! Quase no limite"
+                status_color = "⚠️"
+            elif porcentagem >= 75:
+                emoji = "🟡"
+                status = "Cuidado com os gastos"
+                status_color = "📊"
+            elif porcentagem >= 50:
+                emoji = "🟢"
+                status = "Gastos controlados"
+                status_color = "✅"
+            else:
+                emoji = "💚"
+                status = "Excelente controle!"
+                status_color = "🎯"
+            
+            results.append(f"{emoji} **{category_name_db}**\n💰 Gasto: {calc.format_currency(gasto_atual)} / {calc.format_currency(budget_amount)}\n📊 {porcentagem:.1f}% usado\n💵 Restam: {calc.format_currency(valor_restante)}\n{status_color} {status}")
+        
+        # Resumo geral se mais de um orçamento
+        if len(budgets) > 1:
+            total_percentage = (total_spent / total_budget) * 100 if total_budget > 0 else 0
+            period_text = {"weekly": "semana", "monthly": "mês", "yearly": "ano"}[period_type]
+            
+            resumo = f"\n\n📈 **RESUMO GERAL ({period_text.upper()}):**\n💰 Total gasto: {calc.format_currency(total_spent)}\n🎯 Total orçado: {calc.format_currency(total_budget)}\n📊 {total_percentage:.1f}% do orçamento total usado"
+            
+            results.append(resumo)
+        
+        return "\n\n".join(results)
+        
+    except Exception as e:
+        return f"❌ Erro ao verificar orçamentos: {str(e)}"
+
+
+# Tool para definir meta financeira
+async def set_financial_goal(
+    ctx: RunContext,
+    goal_name: str,
+    target_amount: float,
+    goal_type: str = "savings",
+    target_date: str = None,
+    current_amount: float = 0.0
+) -> str:
+    """
+    Define uma meta financeira.
+    
+    Args:
+        goal_name: Nome da meta
+        target_amount: Valor objetivo
+        goal_type: Tipo ('savings', 'debt_payment', 'purchase', 'emergency_fund', 'investment')
+        target_date: Data objetivo (YYYY-MM-DD)
+        current_amount: Valor já conquistado
+    """
+    if not ctx.deps:
+        return "❌ Erro: Dados do usuário não encontrados"
+    
+    try:
+        from functions_database import supabase
+        
+        # Validar tipo de meta
+        valid_types = {
+            "savings": "💰 Poupança",
+            "debt_payment": "💳 Pagamento de Dívida", 
+            "purchase": "🛒 Compra",
+            "emergency_fund": "🆘 Reserva de Emergência",
+            "investment": "📈 Investimento"
+        }
+        
+        if goal_type not in valid_types:
+            types_text = ", ".join([f"'{k}' ({v})" for k, v in valid_types.items()])
+            return f"❌ Tipo de meta inválido.\n\n📋 Tipos disponíveis: {types_text}"
+        
+        # Converter data se fornecida
+        target_date_obj = None
+        if target_date:
+            try:
+                from datetime import datetime
+                target_date_obj = datetime.strptime(target_date, '%Y-%m-%d').date()
+            except:
+                return "❌ Formato de data inválido. Use YYYY-MM-DD (ex: 2024-12-31)"
+        
+        # Inserir meta
+        result = supabase.table("financial_goals").insert({
+            "user_id": ctx.deps.user_id,
+            "goal_name": goal_name,
+            "goal_type": goal_type,
+            "target_amount": target_amount,
+            "current_amount": current_amount,
+            "target_date": target_date,
+            "is_active": True
+        }).execute()
+        
+        calc = FinancialCalculator()
+        goal_type_name = valid_types[goal_type]
+        
+        percentage = (current_amount / target_amount) * 100 if target_amount > 0 else 0
+        remaining = target_amount - current_amount
+        
+        response = f"🎯 **Meta criada com sucesso!**\n\n{goal_type_name} **{goal_name}**\n💰 Objetivo: {calc.format_currency(target_amount)}\n📊 Atual: {calc.format_currency(current_amount)} ({percentage:.1f}%)\n🎯 Faltam: {calc.format_currency(remaining)}"
+        
+        if target_date:
+            response += f"\n📅 Prazo: {target_date}"
+            
+            # Calcular quanto precisar poupar por mês
+            if target_date_obj and remaining > 0:
+                from datetime import datetime
+                today = datetime.now().date()
+                days_remaining = (target_date_obj - today).days
+                
+                if days_remaining > 0:
+                    months_remaining = days_remaining / 30.44  # Média de dias por mês
+                    monthly_needed = remaining / months_remaining if months_remaining > 0 else remaining
+                    
+                    response += f"\n📈 Precisar poupar: {calc.format_currency(monthly_needed)}/mês"
+        
+        return response
+        
+    except Exception as e:
+        return f"❌ Erro ao criar meta: {str(e)}"
+
+
 # ==================== DEFINIÇÃO DO AGENTE ====================
 
 agent = Agent(
@@ -547,7 +855,10 @@ agent = Agent(
         Tool(edit_transaction),
         Tool(delete_transaction),
         Tool(financial_calculator),
-        Tool(execute_dynamic_query)
+        Tool(execute_dynamic_query),
+        Tool(set_category_budget),
+        Tool(check_budget_status),
+        Tool(set_financial_goal)
     ],
     deps_type=FinanceDeps,
     system_prompt=f"""
@@ -627,6 +938,27 @@ Você é um assistente financeiro pessoal brasileiro especializado em ajudar usu
 - Gastos por categoria: `query_type="summary", grouping="category", filters={{"transaction_type": "expense"}}`
 
 ## 🎯 PRINCIPAIS REGRAS:
+**SEMPRE USE execute_dynamic_query para consultas, análises e relatórios!**
+- Saldo, receitas, despesas por período → execute_dynamic_query
+- Listas de transações, análises por categoria → execute_dynamic_query  
+- Consultas sobre próximo mês, pendências → execute_dynamic_query
+- Esta ferramenta é mais precisa e flexível que as outras!
+
+## 💰 GERENCIAMENTO DE ORÇAMENTOS E METAS:
+**Para definir orçamentos por categoria:**
+- Use set_category_budget para criar limites de gastos mensais
+- Exemplo: "Defina orçamento de R$ 800 para alimentação"
+
+**Para acompanhar orçamentos:**
+- Use check_budget_status para ver status atual vs limite
+- Mostra percentual gasto e alertas automáticos
+
+**Para criar metas financeiras:**
+- Use set_financial_goal para objetivos de longo prazo
+- Tipos: 'savings', 'debt_payment', 'purchase', 'emergency_fund', 'investment'
+- Exemplo: "Criar meta de R$ 10.000 para reserva de emergência"
+
+### 📋 OUTRAS REGRAS IMPORTANTES:
 
 ### 🔥 REGRA #1 - PRIORIDADE ABSOLUTA:
 **SEMPRE USE execute_dynamic_query para consultas, análises e relatórios!**

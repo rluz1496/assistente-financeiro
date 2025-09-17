@@ -1,18 +1,21 @@
 """
-FastAPI para integração com Evolution API (WhatsApp)
+FastAPI para integração com Evolution API (WhatsApp) e API REST para Frontend
 Recebe mensagens do WhatsApp e responde através do assistente financeiro
+Fornece API REST completa para gerenciamento financeiro via frontend web
 """
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, ValidationError
 from typing import Optional, Dict, Any, List
 import json
 import asyncio
 import httpx
 import os
-from datetime import datetime
+import jwt
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # Carregar variáveis de ambiente
@@ -25,15 +28,30 @@ from onboarding import complete_onboarding, check_user_exists
 from media_processor import MediaProcessor, detect_media_type, extract_message_id
 from chat_redis import ChatRedisDatabase
 
+# Imports para API Web
+from web_models import *
+from web_database import WebDatabaseService
+
 # Configurações
 app = FastAPI(
-    title="Assistente Financeiro WhatsApp API",
-    description="API para integração entre Evolution API e o Assistente Financeiro",
+    title="Assistente Financeiro - API Completa",
+    description="API para integração WhatsApp (Evolution API) e Frontend Web",
     version="1.0.0"
 )
 
 # Inicializar Redis para confirmações
 redis_db = ChatRedisDatabase()
+
+# Inicializar serviço de banco web
+db_service = WebDatabaseService()
+
+# Configuração JWT
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-here")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Segurança para API Web
+security = HTTPBearer()
 
 # CORS
 app.add_middleware(
@@ -99,6 +117,44 @@ class OnboardingData(BaseModel):
 
 # Cache para evitar processamento duplicado
 processed_messages = set()
+
+# Utilitários JWT para API Web
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token inválido",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user_id
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+def get_current_user(user_id: str = Depends(verify_token)):
+    user = db_service.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Usuário não encontrado"
+        )
+    return user
 
 async def send_whatsapp_message(phone_number: str, message: str) -> bool:
     """Envia mensagem via Evolution API"""
@@ -663,13 +719,371 @@ async def check_onboarding_status(phone_number: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================================================
+# ROTAS DA API WEB (FRONTEND)
+# ============================================================================
+
+# ENDPOINTS DE AUTENTICAÇÃO
+@app.post("/api/auth/register", response_model=ApiResponse)
+async def register_user(user_data: UserCreate):
+    """Registra um novo usuário"""
+    try:
+        print(f"📝 Dados recebidos para registro: {user_data.dict()}")
+        
+        # Verificar se email já existe
+        print(f"🔍 Verificando se email {user_data.email} já existe...")
+        existing_user = db_service.get_user_by_email(user_data.email)
+        if existing_user:
+            print(f"❌ Email {user_data.email} já está cadastrado")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email já cadastrado"
+            )
+        
+        # Verificar se telefone já existe
+        print(f"🔍 Verificando se telefone {user_data.phone_number} já existe...")
+        existing_phone = db_service.get_user_by_phone(user_data.phone_number)
+        if existing_phone:
+            print(f"❌ Telefone {user_data.phone_number} já está cadastrado")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Telefone já cadastrado"
+            )
+        
+        # Verificar se CPF já existe
+        print(f"🔍 Verificando se CPF {user_data.cpf} já existe...")
+        existing_cpf = db_service.get_user_by_cpf(user_data.cpf)
+        if existing_cpf:
+            print(f"❌ CPF {user_data.cpf} já está cadastrado")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="CPF já cadastrado"
+            )
+        
+        print(f"✅ Email, telefone e CPF estão disponíveis")
+        
+        # Criar usuário
+        print(f"🔨 Criando usuário no banco de dados...")
+        user = db_service.create_user(user_data.dict())
+        print(f"📊 Resultado da criação: {user}")
+        
+        if not user or "error" in user:
+            error_msg = user.get("error", "Erro ao criar usuário") if user else "Erro ao criar usuário"
+            print(f"❌ Erro ao criar usuário: {error_msg}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Erro ao criar usuário: {error_msg}"
+            )
+        
+        # Criar token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": str(user["id"])}, expires_delta=access_token_expires
+        )
+        
+        return ApiResponse(
+            success=True,
+            message="Usuário criado com sucesso",
+            data={
+                "user": UserResponse(**user).dict(),
+                "access_token": access_token,
+                "token_type": "bearer",
+                "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except ValidationError as e:
+        print(f"❌ Erro de validação Pydantic: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Dados inválidos: {str(e)}"
+        )
+    except Exception as e:
+        print(f"❌ Erro interno: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno: {str(e)}"
+        )
+
+@app.post("/api/auth/login", response_model=ApiResponse)
+async def login_user(login_data: UserLogin):
+    """Autentica um usuário"""
+    try:
+        if not login_data.email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email é obrigatório"
+            )
+        
+        # Autenticar usuário
+        user = db_service.verify_user_password(login_data.email, login_data.password)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Email ou senha incorretos"
+            )
+        
+        # Criar token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": str(user["id"])}, expires_delta=access_token_expires
+        )
+        
+        return ApiResponse(
+            success=True,
+            message="Login realizado com sucesso",
+            data={
+                "user": UserResponse(**user).dict(),
+                "access_token": access_token,
+                "token_type": "bearer",
+                "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno: {str(e)}"
+        )
+
+@app.get("/api/auth/me", response_model=ApiResponse)
+async def get_current_user_info(current_user: dict = Depends(get_current_user)):
+    """Retorna informações do usuário autenticado"""
+    return ApiResponse(
+        success=True,
+        message="Dados do usuário",
+        data=UserResponse(**current_user).dict()
+    )
+
+# ENDPOINTS DE CATEGORIAS
+@app.get("/api/categories", response_model=ApiResponse)
+async def get_categories(
+    category_type: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Lista categorias do usuário"""
+    try:
+        categories = db_service.get_user_categories(current_user["id"], category_type)
+        
+        return ApiResponse(
+            success=True,
+            message="Categorias listadas com sucesso",
+            data={"categories": [CategoryResponse(**cat).dict() for cat in categories]}
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno: {str(e)}"
+        )
+
+@app.post("/api/categories", response_model=ApiResponse)
+async def create_category(
+    category_data: CategoryCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Cria uma nova categoria"""
+    try:
+        category = db_service.create_category(current_user["id"], category_data.dict())
+        
+        if not category:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Erro ao criar categoria"
+            )
+        
+        return ApiResponse(
+            success=True,
+            message="Categoria criada com sucesso",
+            data=CategoryResponse(**category).dict()
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno: {str(e)}"
+        )
+
+# ENDPOINTS DE CARTÕES DE CRÉDITO
+@app.get("/api/credit-cards", response_model=ApiResponse)
+async def get_credit_cards(current_user: dict = Depends(get_current_user)):
+    """Lista cartões de crédito do usuário"""
+    try:
+        cards = db_service.get_user_credit_cards(current_user["id"])
+        
+        return ApiResponse(
+            success=True,
+            message="Cartões listados com sucesso",
+            data={"credit_cards": [CreditCardResponse(**card).dict() for card in cards]}
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno: {str(e)}"
+        )
+
+@app.post("/api/credit-cards", response_model=ApiResponse)
+async def create_credit_card(
+    card_data: CreditCardCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Cria um novo cartão de crédito"""
+    try:
+        card = db_service.create_credit_card(current_user["id"], card_data.dict())
+        
+        if not card:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Erro ao criar cartão"
+            )
+        
+        return ApiResponse(
+            success=True,
+            message="Cartão criado com sucesso",
+            data=CreditCardResponse(**card).dict()
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno: {str(e)}"
+        )
+
+# ENDPOINTS DE TRANSAÇÕES
+@app.get("/api/transactions", response_model=ApiResponse)
+async def get_transactions(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    category_id: Optional[str] = None,
+    payment_method: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    credit_card_id: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: dict = Depends(get_current_user)
+):
+    """Lista transações do usuário"""
+    try:
+        filters = {}
+        if start_date:
+            filters['start_date'] = start_date
+        if end_date:
+            filters['end_date'] = end_date
+        if category_id:
+            filters['category_id'] = category_id
+        if payment_method:
+            filters['payment_method'] = payment_method
+        if transaction_type:
+            filters['transaction_type'] = transaction_type
+        if credit_card_id:
+            filters['credit_card_id'] = credit_card_id
+        
+        transactions = db_service.get_user_transactions(
+            current_user["id"], filters, limit, offset
+        )
+        
+        return ApiResponse(
+            success=True,
+            message="Transações listadas com sucesso",
+            data={
+                "transactions": [TransactionResponse(**t).dict() for t in transactions],
+                "total": len(transactions),
+                "limit": limit,
+                "offset": offset
+            }
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno: {str(e)}"
+        )
+
+@app.post("/api/transactions", response_model=ApiResponse)
+async def create_transaction(
+    transaction_data: TransactionCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    """Cria uma nova transação"""
+    try:
+        transaction = db_service.create_transaction(current_user["id"], transaction_data.dict())
+        
+        if not transaction:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Erro ao criar transação"
+            )
+        
+        return ApiResponse(
+            success=True,
+            message="Transação criada com sucesso",
+            data=TransactionResponse(**transaction).dict()
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno: {str(e)}"
+        )
+
+# ENDPOINTS DE DASHBOARD
+@app.get("/api/dashboard", response_model=ApiResponse)
+async def get_dashboard(current_user: dict = Depends(get_current_user)):
+    """Retorna dados do dashboard"""
+    try:
+        dashboard_data = db_service.get_dashboard_data(current_user["id"])
+        
+        return ApiResponse(
+            success=True,
+            message="Dados do dashboard",
+            data=dashboard_data
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno: {str(e)}"
+        )
+
 if __name__ == "__main__":
     import uvicorn
     
-    print("🚀 Iniciando Assistente Financeiro WhatsApp API...")
+    print("🚀 Iniciando Assistente Financeiro - API Completa...")
     print(f"📱 Evolution Instance: {EVOLUTION_INSTANCE}")
     print(f"🔗 Evolution URL: {EVOLUTION_BASE_URL}")
     print(f"🔑 API Key configurada: {'Sim' if EVOLUTION_API_KEY else 'Não'}")
+    print("")
+    print("📊 Endpoints disponíveis:")
+    print("   WhatsApp API:")
+    print("     - POST /webhook/evolution")
+    print("     - GET /users/{phone}")
+    print("     - GET /onboarding")
+    print("     - POST /onboarding/complete")
+    print("")
+    print("   Frontend API (/api/*):")
+    print("     - POST /api/auth/register")
+    print("     - POST /api/auth/login")
+    print("     - GET /api/auth/me")
+    print("     - GET /api/categories")
+    print("     - POST /api/categories")
+    print("     - GET /api/credit-cards")
+    print("     - POST /api/credit-cards")
+    print("     - GET /api/transactions")
+    print("     - POST /api/transactions")
+    print("     - GET /api/dashboard")
+    print("")
+    print("📚 Documentação: http://localhost:8001/docs")
     
     uvicorn.run(
         "api:app",
